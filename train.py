@@ -331,15 +331,18 @@ def load_model_and_processor(args):
     use_deepspeed = getattr(args, "deepspeed", None) is not None
 
     if use_deepspeed:
-        # ZeRO-3: load to CPU; deepspeed.initialize() handles sharding later
-        logger.info("Loading model to CPU for DeepSpeed ZeRO-3 sharding")
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            args.model_name,
-            torch_dtype=dtype,
-            attn_implementation=args.attn_implementation,
-            device_map=None,
-            low_cpu_mem_usage=True,
-        )
+        # ZeRO-3: use zero.Init() to shard parameters across GPUs as they load,
+        # preventing OOM from materializing the full model on one GPU.
+        import deepspeed as _ds
+        logger.info("Loading model with DeepSpeed ZeRO-3 parameter sharding")
+        with _ds.zero.Init(config_dict_or_path=args.deepspeed):
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                args.model_name,
+                torch_dtype=dtype,
+                attn_implementation=args.attn_implementation,
+                device_map=None,
+                low_cpu_mem_usage=True,
+            )
     else:
         # Legacy mode: device_map="auto"
         model = Qwen3VLForConditionalGeneration.from_pretrained(
