@@ -1,0 +1,67 @@
+BootStrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%labels
+    Author AnalogSeeker-Training
+    Version 1.0
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_HOME/lib64/:$CUDA_HOME/lib/:$CUDA_HOME/extras/CUPTI/lib64
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    export PATH=/opt/venv/bin:$PATH
+    export HF_HOME=/hf_cache
+    export TRANSFORMERS_CACHE=/hf_cache
+    export TORCH_HOME=/hf_cache/torch
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_HOME/lib64/:$CUDA_HOME/lib/:$CUDA_HOME/extras/CUPTI/lib64
+
+    apt-get -y update
+    apt-get install -y --no-install-recommends build-essential
+    apt-get install -y --no-install-recommends git
+    apt-get install -y --no-install-recommends vim
+    apt-get install -y --no-install-recommends wget
+    apt-get install -y --no-install-recommends curl
+    apt-get install -y --no-install-recommends ca-certificates
+    apt-get install -y --no-install-recommends python3.11
+    apt-get install -y --no-install-recommends python3.11-venv
+    apt-get install -y --no-install-recommends python3.11-dev
+    apt-get install -y --no-install-recommends python3-pip
+    apt-get install -y --no-install-recommends ninja-build
+    rm -rf /var/lib/apt/lists/*
+
+    python3.11 -m venv /opt/venv
+    . /opt/venv/bin/activate
+
+    pip install --upgrade pip setuptools wheel
+
+    # PyTorch (CUDA 12.4)
+    pip install torch==2.5.1 torchvision==0.20.1 \
+        --index-url https://download.pytorch.org/whl/cu124
+
+    # ML stack (pin versions for reproducibility)
+    # -----------------------------------------------------------------
+    # Qwen3-VL requires transformers >= 4.57.0.
+    # The model config may reference transformers_version: "4.57.0.dev0".
+    # If stable 4.57.0 fails to load the model, bump the pin to the
+    # next stable release (e.g., 4.57.1 or 4.58.0) and rebuild.
+    # Do NOT use unbounded installs.
+    # -----------------------------------------------------------------
+    pip install transformers==4.57.0
+    pip install accelerate==1.6.0
+    pip install peft==0.15.2
+    pip install datasets==3.6.0
+    pip install bitsandbytes==0.45.5
+    pip install deepspeed==0.16.7
+    pip install safetensors sentencepiece protobuf
+    pip install qwen-vl-utils
+    pip install wandb
+    pip install pytest
+
+%runscript
+    exec python3 "$@"
