@@ -1,5 +1,6 @@
 textbooks/
 analog_data/
+output/
 .claude/
 .pytest_cache/
 __pycache__/

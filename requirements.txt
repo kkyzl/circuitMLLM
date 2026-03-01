@@ -1,0 +1,22 @@
+# PyTorch (CUDA 12.4) — install first with:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
+torchvision==0.20.1
+
+# ML stack
+transformers==4.57.0
+accelerate==1.6.0
+peft==0.15.2
+datasets==3.6.0
+bitsandbytes==0.45.5
+deepspeed==0.16.7
+
+# Utilities
+safetensors
+sentencepiece
+protobuf
+qwen-vl-utils
+wandb
+
+# Testing
+pytest
