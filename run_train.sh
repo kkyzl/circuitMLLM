@@ -14,18 +14,21 @@
 # ============================================================================
 # AnalogSeeker NSC-SFT Training — SLURM Submission Script
 #
+# Runtime:
+#   RUNTIME=container — Singularity/Apptainer container (HPC clusters)
+#   RUNTIME=bare      — pip-installed deps on remote server (auto-installs)
+#
 # Modes:
 #   MODE=deepspeed  — DeepSpeed ZeRO-3 + FP16 (for 24GB GPUs like 4090/3090)
 #   MODE=legacy     — torchrun/single GPU + BF16 (for 80GB GPUs like A100)
 #
 # Usage:
-#   sbatch run_train.sh
+#   sbatch run_train.sh          # on SLURM cluster
+#   bash  run_train.sh           # on remote server (bare mode)
 # ============================================================================
 
-module purge
-ml singularity
-
 # --- Configuration (edit these) ---
+RUNTIME=bare     # "container" (Singularity/Apptainer) or "bare" (pip on remote server)
 SIF=/path/to/analogseeker_train.sif
 CODE_DIR=./
 DATA_DIR=./analog_data
@@ -87,30 +90,52 @@ fi
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# --- Build container command ---
-CONTAINER_CMD="apptainer exec --nv --no-home \
-    --env WANDB_API_KEY=${WANDB_API_KEY:-} \
-    --env WANDB_MODE=${WANDB_MODE:-online} \
-    --env NCCL_IB_DISABLE=${NCCL_IB_DISABLE} \
-    --env NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} \
-    -B ${CODE_DIR}:/code \
-    -B ${DATA_DIR}:/data \
-    -B ${HF_CACHE}:/hf_cache \
-    -B ${OUTPUT_DIR}:/output \
-    ${SIF}"
+# --- Runtime setup ---
+if [ "$RUNTIME" = "container" ]; then
+    module purge
+    ml singularity
+
+    CONTAINER_CMD="apptainer exec --nv --no-home \
+        --env WANDB_API_KEY=${WANDB_API_KEY:-} \
+        --env WANDB_MODE=${WANDB_MODE:-online} \
+        --env NCCL_IB_DISABLE=${NCCL_IB_DISABLE} \
+        --env NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} \
+        -B ${CODE_DIR}:/code \
+        -B ${DATA_DIR}:/data \
+        -B ${HF_CACHE}:/hf_cache \
+        -B ${OUTPUT_DIR}:/output \
+        ${SIF}"
+    SCRIPT=/code/train.py
+    DS_CONFIG=/code/ds_zero3_config.json
+else
+    # Bare-metal: install dependencies if needed
+    echo "=== Bare-metal mode: checking dependencies ==="
+    if ! python3 -c "import transformers" 2>/dev/null; then
+        echo "Installing dependencies..."
+        pip install -r ${CODE_DIR}/requirements.txt
+    fi
+    CONTAINER_CMD=""
+    SCRIPT=${CODE_DIR}/train.py
+    DS_CONFIG=${CODE_DIR}/ds_zero3_config.json
+fi
+
+# --- Resolve paths for bare-metal (use local paths instead of container mounts) ---
+if [ "$RUNTIME" = "bare" ]; then
+    TRAIN_ARGS=$(echo "$TRAIN_ARGS" | sed "s|/data/|${DATA_DIR}/|g; s|/output|${OUTPUT_DIR}|g; s|/code/|${CODE_DIR}/|g")
+fi
 
 # --- Launch ---
 if [ "$MODE" = "deepspeed" ]; then
     echo "=== DeepSpeed ZeRO-3 training (${NGPU} GPUs, FP16) ==="
     ${CONTAINER_CMD} deepspeed \
         --num_gpus=${NGPU} \
-        /code/train.py ${TRAIN_ARGS}
+        ${SCRIPT} ${TRAIN_ARGS}
 elif [ "$NGPU" -eq 1 ]; then
     echo "=== Single GPU training (legacy) ==="
-    ${CONTAINER_CMD} python3 /code/train.py ${TRAIN_ARGS}
+    ${CONTAINER_CMD} python3 ${SCRIPT} ${TRAIN_ARGS}
 else
     echo "=== Multi-GPU training (${NGPU} GPUs, torchrun, legacy) ==="
-    ${CONTAINER_CMD} torchrun --nproc_per_node=${NGPU} /code/train.py ${TRAIN_ARGS}
+    ${CONTAINER_CMD} torchrun --nproc_per_node=${NGPU} ${SCRIPT} ${TRAIN_ARGS}
 fi
 
 echo "=== Training complete ==="
