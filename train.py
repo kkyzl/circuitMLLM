@@ -116,7 +116,7 @@ def parse_args():
                     help="Local rank for distributed training (set by DeepSpeed launcher)")
     p.add_argument("--fp16", action="store_true", default=False,
                     help="Use FP16 instead of BF16 (required for RTX 3090)")
-    p.add_argument("--kl_chunk_size", type=int, default=512,
+    p.add_argument("--kl_chunk_size", type=int, default=128,
                     help="Chunk size along sequence dim for KL computation "
                          "(reduces peak memory; 0=no chunking)")
 
@@ -429,15 +429,15 @@ def _compute_kl_chunked(shift_logits, shift_ref_logits, mask, mask_sum,
                          chunk_size):
     """Compute KL(p_policy || p_ref) in chunks along the sequence dimension.
 
-    At seq=8192, vocab=152064, FP16:
-    - Full tensor: [1, 8191, 152064] = 2.49 GB
-    - Chunk of 512: [1, 512, 152064] = 0.16 GB
-    - Peak with intermediates (log_p, log_q, p, diff): ~0.6 GB per chunk
+    shift_ref_logits may reside on CPU (to save ~2.5 GB GPU memory).
+    Each chunk is moved to GPU on-the-fly and freed immediately.
 
-    This reduces peak memory from ~15-20 GB to ~1-2 GB.
+    Uses F.kl_div (fused C++ kernel) to avoid materializing separate
+    p, log_p-log_q, and p*(log_p-log_q) intermediate tensors.
     """
+    device = shift_logits.device
     seq_len = shift_logits.size(1)
-    kl_sum = torch.tensor(0.0, device=shift_logits.device, dtype=torch.float32)
+    kl_sum = torch.tensor(0.0, device=device, dtype=torch.float32)
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
@@ -447,15 +447,24 @@ def _compute_kl_chunked(shift_logits, shift_ref_logits, mask, mask_sum,
             continue
 
         chunk_logits = shift_logits[:, start:end, :]
-        chunk_ref_logits = shift_ref_logits[:, start:end, :]
+        # Move ref chunk from CPU → GPU (non-blocking for overlap)
+        chunk_ref_logits = shift_ref_logits[:, start:end, :].to(
+            device, non_blocking=True
+        )
 
         log_p = F.log_softmax(chunk_logits, dim=-1)
         log_q = F.log_softmax(chunk_ref_logits, dim=-1)
-        p = log_p.exp()
-        kl_per_token = (p * (log_p - log_q)).sum(dim=-1)
-        kl_sum = kl_sum + (kl_per_token * chunk_mask).sum().float()
+        del chunk_ref_logits  # free GPU copy of ref chunk
 
-        del log_p, log_q, p, kl_per_token
+        # F.kl_div(input=log_q, target=log_p, log_target=True) computes
+        # exp(log_p) * (log_p - log_q) per element = KL(p_policy || p_ref)
+        kl_per_token = F.kl_div(
+            log_q, log_p, log_target=True, reduction="none"
+        ).sum(dim=-1)
+        del log_p, log_q
+
+        kl_sum = kl_sum + (kl_per_token * chunk_mask).sum().float()
+        del kl_per_token
 
     return kl_sum / mask_sum.float()
 
@@ -498,13 +507,18 @@ def compute_nsc_sft_loss(policy_logits, ref_logits, labels, lambda_kl,
             )
         else:
             # Original unchunked path (for small sequences / backward compat)
+            # Move ref to same device as policy if needed (CPU offload case)
+            ref_on_device = shift_ref_logits.to(shift_logits.device)
             log_p = F.log_softmax(shift_logits, dim=-1)
-            log_q = F.log_softmax(shift_ref_logits, dim=-1)
-            p = log_p.exp()
-            kl_per_token = (p * (log_p - log_q)).sum(dim=-1)
+            log_q = F.log_softmax(ref_on_device, dim=-1)
+            del ref_on_device
+            kl_per_token = F.kl_div(
+                log_q, log_p, log_target=True, reduction="none"
+            ).sum(dim=-1)
+            del log_p, log_q
             kl_loss = (kl_per_token * mask).sum() / mask_sum
     else:
-        kl_loss = torch.tensor(0.0, device=policy_logits.device)
+        kl_loss = torch.tensor(0.0, device=shift_logits.device)
 
     total_loss = ce_loss + lambda_kl * kl_loss
 
@@ -536,9 +550,10 @@ def evaluate(model, val_dataloader, lambda_kl, device, use_deepspeed=False,
         assert "image_grid_thw" not in batch, "Batch contains image_grid_thw — text-only training expected"
 
         # Reference forward (LoRA disabled, eval mode)
+        # Offload ref_logits to CPU to save ~2.5 GB GPU memory
         with base.disable_adapter():
             ref_out = model(input_ids=input_ids, attention_mask=attention_mask)
-            ref_logits = ref_out.logits.detach()
+            ref_logits = ref_out.logits.detach().to("cpu")
             del ref_out
 
         # Policy forward (LoRA enabled, still in eval mode for val)
@@ -1169,9 +1184,12 @@ def main():
             assert "image_grid_thw" not in batch, "Batch contains image_grid_thw — text-only training expected"
 
             # Reference forward: eval() + LoRA disabled + no_grad
+            # Offload ref_logits to CPU immediately to save ~2.5 GB GPU memory.
+            # They are only needed for KL (not CE) and will be moved back
+            # chunk-by-chunk inside _compute_kl_chunked.
             with reference_mode(model, use_deepspeed=use_deepspeed):
                 ref_out = model(input_ids=input_ids, attention_mask=attention_mask)
-                ref_logits = ref_out.logits.detach()
+                ref_logits = ref_out.logits.detach().to("cpu")
                 del ref_out
 
             # Policy forward: train() + LoRA enabled
