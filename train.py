@@ -313,7 +313,7 @@ def get_or_create_split(all_samples, output_dir, val_split_ratio, seed):
 # ---------------------------------------------------------------------------
 # Model setup
 # ---------------------------------------------------------------------------
-def load_model_and_processor(args):
+def load_model_and_processor(args, ds_config=None):
     """Load Qwen3-VL with frozen vision encoder and LoRA on LLM."""
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     from peft import LoraConfig, get_peft_model
@@ -335,7 +335,7 @@ def load_model_and_processor(args):
         # preventing OOM from materializing the full model on one GPU.
         import deepspeed as _ds
         logger.info("Loading model with DeepSpeed ZeRO-3 parameter sharding")
-        with _ds.zero.Init(config_dict_or_path=args.deepspeed):
+        with _ds.zero.Init(config_dict_or_path=ds_config):
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 args.model_name,
                 torch_dtype=dtype,
@@ -862,6 +862,35 @@ def main():
 
     set_seed(args.seed)
 
+    # --- Early DeepSpeed config resolution (batch sizes + optimizer) ---
+    # Needed before model loading because deepspeed.zero.Init() validates batch sizes.
+    ds_config = None
+    if use_deepspeed:
+        with open(args.deepspeed, "r") as f:
+            ds_config = json.load(f)
+
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # Batch sizes (must be resolved before zero.Init)
+        ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+        ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+        ds_config["train_batch_size"] = (
+            args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
+        )
+
+        # Optimizer (doesn't depend on step count)
+        if "optimizer" in ds_config:
+            opt_params = ds_config["optimizer"].get("params", {})
+            if opt_params.get("lr") == "auto":
+                opt_params["lr"] = args.learning_rate
+            if opt_params.get("weight_decay") == "auto":
+                opt_params["weight_decay"] = args.weight_decay
+
+        logger.info(f"DeepSpeed config: batch={ds_config['train_batch_size']}, "
+                     f"micro_batch={ds_config['train_micro_batch_size_per_gpu']}, "
+                     f"grad_accum={ds_config['gradient_accumulation_steps']}, "
+                     f"world_size={world_size}")
+
     # Create output dir and save config (main process only)
     if is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -911,7 +940,7 @@ def main():
     val_samples = [all_samples[i] for i in val_indices]
 
     # Load model
-    model, processor = load_model_and_processor(args)
+    model, processor = load_model_and_processor(args, ds_config=ds_config)
 
     # Create datasets
     train_dataset = SFTDataset(train_samples, processor, args.max_seq_length)
@@ -974,30 +1003,10 @@ def main():
     wandb_run_id = None
 
     if use_deepspeed:
-        # --- Resolve "auto" values in DeepSpeed config ---
-        with open(args.deepspeed, "r") as f:
-            ds_config = json.load(f)
-
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        # --- Resolve remaining "auto" values (scheduler depends on step count) ---
         total_train_steps = steps_per_epoch * args.num_train_epochs
         warmup_steps = int(total_train_steps * args.warmup_ratio)
 
-        # Batch sizes
-        ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-        ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
-        ds_config["train_batch_size"] = (
-            args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
-        )
-
-        # Optimizer
-        if "optimizer" in ds_config:
-            opt_params = ds_config["optimizer"].get("params", {})
-            if opt_params.get("lr") == "auto":
-                opt_params["lr"] = args.learning_rate
-            if opt_params.get("weight_decay") == "auto":
-                opt_params["weight_decay"] = args.weight_decay
-
-        # Scheduler
         if "scheduler" in ds_config:
             sched_params = ds_config["scheduler"].get("params", {})
             if sched_params.get("warmup_max_lr") == "auto":
@@ -1006,11 +1015,6 @@ def main():
                 sched_params["warmup_num_steps"] = warmup_steps
             if sched_params.get("total_num_steps") == "auto":
                 sched_params["total_num_steps"] = total_train_steps
-
-        logger.info(f"DeepSpeed config: batch={ds_config['train_batch_size']}, "
-                     f"micro_batch={ds_config['train_micro_batch_size_per_gpu']}, "
-                     f"grad_accum={ds_config['gradient_accumulation_steps']}, "
-                     f"world_size={world_size}")
 
         # --- DeepSpeed engine initialization ---
         # DeepSpeed manages optimizer, scheduler, gradient accumulation, and clipping.
