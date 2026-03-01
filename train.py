@@ -972,7 +972,6 @@ def main():
 
     if use_deepspeed:
         # --- Resolve "auto" values in DeepSpeed config ---
-        import json
         with open(args.deepspeed, "r") as f:
             ds_config = json.load(f)
 
