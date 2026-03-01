@@ -127,7 +127,7 @@ fi
 # --- Launch ---
 if [ "$MODE" = "deepspeed" ]; then
     echo "=== DeepSpeed ZeRO-3 training (${NGPU} GPUs, FP16) ==="
-    ${CONTAINER_CMD} deepspeed \
+    ${CONTAINER_CMD} python3 -m deepspeed.launcher.runner \
         --num_gpus=${NGPU} \
         ${SCRIPT} ${TRAIN_ARGS}
 elif [ "$NGPU" -eq 1 ]; then
