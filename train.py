@@ -69,7 +69,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--bf16", action="store_true", default=True)
+    p.add_argument("--bf16", action="store_true", default=False)
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lambda_kl", type=float, default=0.1,
@@ -831,10 +831,12 @@ def log_wandb(metrics: dict):
 def main():
     args = parse_args()
 
-    # --- FP16/BF16 mutual exclusivity ---
+    # --- FP16/BF16 defaults and mutual exclusivity ---
     if args.fp16 and args.bf16:
         args.bf16 = False
         logger.warning("Both --fp16 and --bf16 set; disabling bf16 in favor of fp16")
+    elif not args.fp16 and not args.bf16:
+        args.bf16 = True  # default to bf16 when neither is specified
 
     # --- Distributed / DeepSpeed initialization ---
     use_deepspeed = args.deepspeed is not None
@@ -886,7 +888,7 @@ def main():
     logger.info(f"Device: {device}")
     if torch.cuda.is_available():
         logger.info(f"GPU: {torch.cuda.get_device_name()}")
-        logger.info(f"VRAM: {torch.cuda.get_device_properties(device.index or 0).total_mem / 1e9:.1f} GB")
+        logger.info(f"VRAM: {torch.cuda.get_device_properties(device.index or 0).total_memory / 1e9:.1f} GB")
 
     # Load data
     all_samples = load_jsonl(args.data_path)
