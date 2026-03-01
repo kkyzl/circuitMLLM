@@ -473,14 +473,16 @@ def compute_nsc_sft_loss(policy_logits, ref_logits, labels, lambda_kl,
     CE remains unchunked because F.cross_entropy is already memory-efficient.
     """
     # Shift for causal LM: predict next token
-    shift_logits = policy_logits[..., :-1, :].contiguous()
-    shift_ref_logits = ref_logits[..., :-1, :].contiguous()
+    # Use views (no .contiguous()) to avoid duplicating ~2.5 GB logit tensors
+    shift_logits = policy_logits[..., :-1, :]
+    shift_ref_logits = ref_logits[..., :-1, :]
     shift_labels = labels[..., 1:].contiguous()
 
     # CE loss (masked via ignore_index=-100)
+    # Use .reshape() instead of .view() to handle non-contiguous views
     ce_loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
         ignore_index=-100,
         reduction="mean",
     )
@@ -536,16 +538,19 @@ def evaluate(model, val_dataloader, lambda_kl, device, use_deepspeed=False,
         # Reference forward (LoRA disabled, eval mode)
         with base.disable_adapter():
             ref_out = model(input_ids=input_ids, attention_mask=attention_mask)
-            ref_logits = ref_out.logits
+            ref_logits = ref_out.logits.detach()
+            del ref_out
 
         # Policy forward (LoRA enabled, still in eval mode for val)
         policy_out = model(input_ids=input_ids, attention_mask=attention_mask)
         policy_logits = policy_out.logits
+        del policy_out
 
         loss, ce, kl = compute_nsc_sft_loss(
             policy_logits, ref_logits, labels, lambda_kl,
             kl_chunk_size=kl_chunk_size,
         )
+        del ref_logits, policy_logits
 
         total_ce += ce.item()
         total_kl += kl.item()
@@ -1167,17 +1172,20 @@ def main():
             with reference_mode(model, use_deepspeed=use_deepspeed):
                 ref_out = model(input_ids=input_ids, attention_mask=attention_mask)
                 ref_logits = ref_out.logits.detach()
+                del ref_out
 
             # Policy forward: train() + LoRA enabled
             base_model.train()
             policy_out = model(input_ids=input_ids, attention_mask=attention_mask)
             policy_logits = policy_out.logits
+            del policy_out
 
             # NSC-SFT loss
             total_loss, ce_loss, kl_loss = compute_nsc_sft_loss(
                 policy_logits, ref_logits, labels, args.lambda_kl,
                 kl_chunk_size=args.kl_chunk_size,
             )
+            del ref_logits, policy_logits
 
             # Backward + step
             if use_deepspeed:
