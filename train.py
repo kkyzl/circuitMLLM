@@ -1007,8 +1007,6 @@ def main():
 
         if "scheduler" in ds_config:
             sched_params = ds_config["scheduler"].get("params", {})
-            if sched_params.get("warmup_max_lr") == "auto":
-                sched_params["warmup_max_lr"] = args.learning_rate
             if sched_params.get("warmup_num_steps") == "auto":
                 sched_params["warmup_num_steps"] = warmup_steps
             if sched_params.get("total_num_steps") == "auto":
