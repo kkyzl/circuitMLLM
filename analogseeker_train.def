@@ -16,6 +16,9 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
     export PYTHONUNBUFFERED=1
     export LC_ALL=C
 
+%files
+    requirements.txt /code/requirements.txt
+
 %post
     export DEBIAN_FRONTEND=noninteractive
     export CUDA_HOME=/usr/local/cuda
@@ -40,28 +43,9 @@ From: nvidia/cuda:12.4.1-devel-ubuntu22.04
 
     pip install --upgrade pip setuptools wheel
 
-    # PyTorch (CUDA 12.4)
-    pip install torch==2.5.1 torchvision==0.20.1 \
-        --index-url https://download.pytorch.org/whl/cu124
-
-    # ML stack (pin versions for reproducibility)
-    # -----------------------------------------------------------------
-    # Qwen3-VL requires transformers >= 4.57.0.
-    # The model config may reference transformers_version: "4.57.0.dev0".
-    # If stable 4.57.0 fails to load the model, bump the pin to the
-    # next stable release (e.g., 4.57.1 or 4.58.0) and rebuild.
-    # Do NOT use unbounded installs.
-    # -----------------------------------------------------------------
-    pip install transformers==4.57.0
-    pip install accelerate==1.6.0
-    pip install peft==0.15.2
-    pip install datasets==3.6.0
-    pip install bitsandbytes==0.45.5
-    pip install deepspeed==0.16.7
-    pip install safetensors sentencepiece protobuf
-    pip install qwen-vl-utils
-    pip install wandb
-    pip install pytest
+    # Install all dependencies from requirements.txt
+    # (requirements.txt includes --extra-index-url for PyTorch CUDA 12.4)
+    pip install -r /code/requirements.txt
 
 %runscript
     exec python3 "$@"

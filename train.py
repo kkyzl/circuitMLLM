@@ -330,25 +330,18 @@ def load_model_and_processor(args, ds_config=None):
 
     use_deepspeed = getattr(args, "deepspeed", None) is not None
 
-    if use_deepspeed:
-        # ZeRO-3: load model to CPU first, then deepspeed.initialize() shards
-        # it across GPUs. The full model (~18 GB FP16) fits in host RAM.
-        logger.info("Loading model to CPU for DeepSpeed ZeRO-3 sharding")
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            args.model_name,
-            torch_dtype=dtype,
-            attn_implementation=args.attn_implementation,
-            device_map=None,
-            low_cpu_mem_usage=True,
-        )
-    else:
-        # Legacy mode: device_map="auto"
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            args.model_name,
-            torch_dtype=dtype,
-            attn_implementation=args.attn_implementation,
-            device_map="auto",
-        )
+    # Always load to CPU first, then move to GPU.
+    # - DeepSpeed: deepspeed.initialize() handles sharding to GPUs later.
+    # - Legacy: we call model.to(device) after this function returns.
+    # Avoids device_map="auto" which is incompatible with gradient
+    # checkpointing and fails when NVML is unavailable.
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_name,
+        torch_dtype=dtype,
+        attn_implementation=args.attn_implementation,
+        device_map=None,
+        low_cpu_mem_usage=True,
+    )
 
     processor = AutoProcessor.from_pretrained(args.model_name)
 
@@ -651,7 +644,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step,
 
         # DeepSpeed engine state (sharded optimizer, scheduler, etc.)
         ds_ckpt_dir = save_dir / "deepspeed_state"
-        model.save_checkpoint(str(ds_ckpt_dir), tag="latest")
+        model.save_checkpoint(str(ds_ckpt_dir), tag="ds_ckpt")
     else:
         # Legacy mode
         model.save_pretrained(str(save_dir))
@@ -693,7 +686,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device,
         ds_ckpt_dir = checkpoint_dir / "deepspeed_state"
         if ds_ckpt_dir.exists():
             _, client_state = model.load_checkpoint(
-                str(ds_ckpt_dir), tag="latest"
+                str(ds_ckpt_dir), tag="ds_ckpt"
             )
             logger.info("Loaded DeepSpeed engine checkpoint (optimizer + scheduler + params)")
         else:
@@ -960,6 +953,12 @@ def main():
     # Load model
     model, processor = load_model_and_processor(args, ds_config=ds_config)
 
+    # Legacy mode: move model from CPU to GPU
+    # (DeepSpeed mode: deepspeed.initialize() handles this later)
+    if not use_deepspeed:
+        model = model.to(device)
+        logger.info(f"Model moved to {device}")
+
     # Create datasets
     train_dataset = SFTDataset(train_samples, processor, args.max_seq_length)
     val_dataset = SFTDataset(val_samples, processor, args.max_seq_length)
@@ -1166,6 +1165,12 @@ def main():
     tokens_processed = 0
     training_start_time = time.time()
 
+    # Accumulation-window loss averaging (Part 1)
+    accum_loss = 0.0
+    accum_ce = 0.0
+    accum_kl = 0.0
+    accum_count = 0
+
     for epoch in range(start_epoch, args.num_train_epochs):
         logger.info(f"--- Epoch {epoch + 1}/{args.num_train_epochs} ---")
         epoch_start_time = time.time()
@@ -1205,6 +1210,20 @@ def main():
             )
             del ref_logits, policy_logits
 
+            # Accumulate losses for window averaging (detached scalars, no GPU cost)
+            accum_loss += total_loss.detach().item()
+            accum_ce += ce_loss.detach().item()
+            accum_kl += kl_loss.detach().item()
+            accum_count += 1
+
+            # Detect optimizer step boundary BEFORE backward/step
+            # DeepSpeed: check boundary based on internal micro-step counter
+            # Legacy: count micro-steps ourselves
+            if use_deepspeed:
+                is_optimizer_step = model.is_gradient_accumulation_boundary()
+            else:
+                is_optimizer_step = ((micro_step + 1) % args.gradient_accumulation_steps == 0)
+
             # Backward + step
             if use_deepspeed:
                 # DeepSpeed handles loss scaling, gradient accumulation, clipping
@@ -1218,12 +1237,6 @@ def main():
             n_tokens = (attention_mask.sum()).item()
             tokens_processed += n_tokens
             micro_step += 1
-
-            # Detect optimizer step boundary
-            if use_deepspeed:
-                is_optimizer_step = model.is_gradient_accumulation_boundary()
-            else:
-                is_optimizer_step = (micro_step % args.gradient_accumulation_steps == 0)
 
             if is_optimizer_step:
                 if not use_deepspeed:
@@ -1243,6 +1256,15 @@ def main():
 
                 global_step += 1
 
+                # Compute window-averaged losses
+                avg_loss = accum_loss / accum_count
+                avg_ce = accum_ce / accum_count
+                avg_kl = accum_kl / accum_count
+                accum_loss = 0.0
+                accum_ce = 0.0
+                accum_kl = 0.0
+                accum_count = 0
+
                 # Compute elapsed time and throughput
                 elapsed = time.time() - epoch_start_time
                 tokens_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
@@ -1257,21 +1279,21 @@ def main():
                 # Fractional epoch
                 frac_epoch = epoch + (batch_idx + 1) / len(train_dataloader)
 
-                # Log
+                # Log window-averaged losses (not just last micro-batch)
                 if global_step % 10 == 0 or global_step == 1:
                     logger.info(
                         f"Step {global_step} | epoch {frac_epoch:.2f} | "
-                        f"loss={total_loss.item():.4f} ce={ce_loss.item():.4f} "
-                        f"kl={kl_loss.item():.4f} | lr={current_lr:.2e} | "
+                        f"loss={avg_loss:.4f} ce={avg_ce:.4f} "
+                        f"kl={avg_kl:.4f} | lr={current_lr:.2e} | "
                         f"grad_norm={grad_norm:.3f} | tok/s={tokens_per_sec:.0f}"
                     )
 
                 # WandB logging (main process only)
                 if is_main_process:
                     log_wandb({
-                        "train/loss": total_loss.item(),
-                        "train/ce_loss": ce_loss.item(),
-                        "train/kl_loss": kl_loss.item(),
+                        "train/loss": avg_loss,
+                        "train/ce_loss": avg_ce,
+                        "train/kl_loss": avg_kl,
                         "train/learning_rate": current_lr,
                         "train/epoch": frac_epoch,
                         "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
@@ -1297,6 +1319,17 @@ def main():
                     logger.info(f"  Est. time/epoch: {pilot_metrics['estimated_time_per_epoch_hr']:.1f} hr")
                     return
 
+                # Early checkpoint test at step 10 to catch save errors fast
+                if global_step == 10:
+                    logger.info("Step 10: testing checkpoint save...")
+                    save_checkpoint(
+                        model, optimizer, scheduler, epoch, global_step,
+                        best_val_loss, args.seed, wandb_run_id,
+                        Path(args.output_dir) / "checkpoints" / "step10_test",
+                        use_deepspeed=use_deepspeed,
+                    )
+                    logger.info("Step 10: checkpoint save OK — training is safe to run.")
+
                 # Eval at boundary
                 if global_step % eval_every_steps == 0:
                     logger.info(f"--- Eval at step {global_step} (epoch {frac_epoch:.2f}) ---")
@@ -1314,6 +1347,7 @@ def main():
                             "val/kl_loss": val_kl,
                             "val/total_loss": val_total,
                             "val/step": global_step,
+                            "val/epoch": frac_epoch,
                         })
 
                     # Format compliance at epoch boundaries
@@ -1350,16 +1384,6 @@ def main():
                         use_deepspeed=use_deepspeed,
                     )
 
-                    # Epoch-boundary checkpoint (designed for resume)
-                    if is_epoch_boundary:
-                        epoch_num = round(frac_epoch)
-                        save_checkpoint(
-                            model, optimizer, scheduler, epoch_num, global_step,
-                            best_val_loss, args.seed, wandb_run_id,
-                            Path(args.output_dir) / "checkpoints" / f"epoch-{epoch_num}",
-                            use_deepspeed=use_deepspeed,
-                        )
-
                     # Early stopping check
                     if early_stopper.check(val_ce, val_total, frac_epoch):
                         logger.info("Early stopping triggered. Loading best checkpoint.")
@@ -1368,7 +1392,15 @@ def main():
                     base_model.train()
 
         else:
-            # Loop completed without break (no early stopping)
+            # Epoch completed without early stopping — always save epoch checkpoint
+            epoch_num = epoch + 1
+            logger.info(f"Epoch {epoch_num} complete. Saving epoch checkpoint...")
+            save_checkpoint(
+                model, optimizer, scheduler, epoch_num, global_step,
+                best_val_loss, args.seed, wandb_run_id,
+                Path(args.output_dir) / "checkpoints" / f"epoch-{epoch_num}",
+                use_deepspeed=use_deepspeed,
+            )
             continue
         # Early stopping break propagated from inner loop
         break

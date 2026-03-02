@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=asft_train
-#SBATCH --partition=normal
+#SBATCH --job-name=asft_dev
+#SBATCH --partition=dev
 #SBATCH --account=MST111121
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
-#SBATCH --time=48:00:00
-#SBATCH -o asft_train_%j.out
-#SBATCH -e asft_train_%j.err
+#SBATCH --time=02:00:00
+#SBATCH -o asft_dev_%j.out
+#SBATCH -e asft_dev_%j.err
 # 可選：寄信通知
 # #SBATCH --mail-type=END,FAIL
 # #SBATCH --mail-user=YOUR_EMAIL_HERE
@@ -18,49 +18,49 @@ set -euo pipefail
 module purge
 ml singularity/3.7.1
 
-# ---- Paths (請填 SIF) ----
-SIF="$HOME/analogseeker_train.sif"          # TODO: 改成你的實際路徑
+# ----- Host paths -----
+SIF="$HOME/analogseeker_train.sif"          # TODO: 改成你的 sif 實際路徑
 CODE_DIR="$PWD"
 DATA_DIR="$PWD/analog_data"
 OUTPUT_DIR="$PWD/output"
 
-# 建議：cache 放到 /work 或 $HOME (不要放 $PWD 若 $PWD 在網路檔系統上會很慢)
-HF_CACHE="/work/$USER/hf_cache"             # 若沒有 /work，改成 "$HOME/hf_cache"
+# 建議 cache 放 /work（若你們沒有 /work，改成 "$HOME/hf_cache"）
+HF_CACHE="/work/$USER/hf_cache"
+
 mkdir -p "$OUTPUT_DIR" "$HF_CACHE"
 
-# ---- CPU/BLAS threading (避免 OpenBLAS thread 爆炸) ----
+# ----- Threading / tokenizers (避免 OpenBLAS thread 爆炸) -----
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export TOKENIZERS_PARALLELISM=false
 
-# ---- NCCL / network ----
-# 你之前在 login node 設過 UCX_*，這裡先保守：
-# 若你確定 IB/UCX 設定正確再打開。很多叢集 torchrun + NCCL 走 TCP 也能跑單節點。
+# ----- NCCL (dev 先保守) -----
+# 單節點通常關 IB 更穩；確認都 OK 再改回 0
 export NCCL_DEBUG=WARN
-export NCCL_IB_DISABLE=1     # 單節點通常關掉 IB 反而更穩；要開再改 0
+export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# ---- HF cache routing ----
-# 你的 def 已設定 HF_HOME=/hf_cache，但我們在這裡也顯式設一次，確保一致
+# ----- HF cache routing -----
 export HF_HOME=/hf_cache
 export TORCH_HOME=/hf_cache/torch
 export XDG_CACHE_HOME=/hf_cache/xdg
 
-# 可選：如果你已經把模型 cache 搬到 HF_CACHE，想強制離線避免 compute node 外網問題：
+# 可選：如果你已經把模型 cache 準備好，想強制離線避免 compute node 外網問題就打開：
 # export HF_HUB_OFFLINE=1
 # export TRANSFORMERS_OFFLINE=1
 
-# ---- torchrun settings ----
-NGPU="${SLURM_GPUS_ON_NODE:-4}"
-MASTER_ADDR="127.0.0.1"     # 單節點用 loopback 最穩
+# ----- torchrun -----
+NGPU_RAW="${SLURM_GPUS_ON_NODE:-4}"
+NGPU="${NGPU_RAW##*:}"     # 防止有些系統回傳 gpu:4
+MASTER_ADDR="127.0.0.1"    # 單節點用 loopback 最穩
 MASTER_PORT=29500
 
-# ---- WandB (可選) ----
-# export WANDB_API_KEY=...
-# export WANDB_MODE=online   # 或 offline
+echo "NGPU_RAW=${NGPU_RAW} -> NGPU=${NGPU}"
+echo "HF_CACHE(host)=${HF_CACHE} -> /hf_cache(container)"
 
+# ----- Training args (container paths) -----
 ARGS=" \
   --model_name Qwen/Qwen3-VL-8B-Instruct \
   --data_path /data/sft.jsonl \
@@ -77,14 +77,14 @@ ARGS=" \
   --gradient_checkpointing \
   --attn_implementation eager \
   --kl_chunk_size 512 \
-  --per_device_train_batch_size 2 \
+  --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 8 \
   --bf16 \
   --dataloader_num_workers 4 \
-  --evals_per_epoch 4 \
-  --format_check_samples 64 \
-  --report_to wandb \
-  --wandb_project analogseeker_sft \
+  --pilot_steps 30 \
+  --evals_per_epoch 999999 \
+  --format_check_samples 0 \
+  --report_to none \
 "
 
 # ---- Run (不要用 srun 再包 torchrun 多進程) ----
@@ -102,8 +102,6 @@ singularity exec --nv --no-home \
   --env OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS} \
   --env NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS} \
   --env TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM} \
-  --env WANDB_API_KEY=${WANDB_API_KEY:-} \
-  --env WANDB_MODE=${WANDB_MODE:-online} \
   -B "${CODE_DIR}:/code" \
   -B "${DATA_DIR}:/data" \
   -B "${OUTPUT_DIR}:/output" \
@@ -112,4 +110,4 @@ singularity exec --nv --no-home \
   torchrun --nproc_per_node="${NGPU}" --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}" \
     /code/train.py ${ARGS}
 
-echo "=== DONE ==="
+echo "=== DEV PILOT DONE ==="

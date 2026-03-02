@@ -5,5 +5,7 @@ output/
 .pytest_cache/
 __pycache__/
 .vscode/
+wandb/
 .md
 *.sif
+*.tgz
